@@ -18,7 +18,8 @@
 void gelu_and_quant(torch::Tensor &out,   // [..., d]
                                 torch::Tensor &input, // [..., d]
                                 torch::Tensor &scale_out, // [num_tokens]
-                                torch::Tensor &tmp // [num_tokens, d]
+                                torch::Tensor &tmp, // [num_tokens, d]
+                                bool tanh
 );
 
 torch::Tensor silu_and_mul(torch::Tensor &input  // [..., 2 * d]

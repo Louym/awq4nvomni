@@ -120,7 +120,7 @@ __global__ void generalLayerNorm(const T* input, const T* gamma, const T* beta, 
         for (int i = tidx; i < n_elems; i += blockDim.x)
         {
             const T val = use_shmem ? shmem[i] : input[bidx * n_elems + i];
-            float_packed_t diff = cuda_cast<float_packed_t>(val); // - s_mean;
+            float_packed_t diff = cuda_cast<float_packed_t>(val) - s_mean;
             local_var_sum += cuda_sum<float>(diff * diff);
         }
         variance = blockReduceSum(local_var_sum);

@@ -5,5 +5,6 @@ from .fused_vision_attn import *
 try:
     from .fused_siglipdecoder import *
     from .fused_internencoder import *
+    from .fused_Qwen2AudioEncoder import *
 except ImportError as e:
     print("InternVL3 model import failure. To activate, please install VILA at https://github.com/NVlabs/VILA.")

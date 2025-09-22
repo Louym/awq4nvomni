@@ -34,5 +34,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("weight"), py::arg("bias"),py::arg("scaling"), py::arg("epsilon"), py::arg("use_per_token_quant") = true,
         "Apply Root Mean Square (RMS) Normalization to the input tensor (TRTLLM kernel).");
     m.def("silu_and_mul", &silu_and_mul, "Activation function.");
-    m.def("gelu_and_quant",&gelu_and_quant, "Apply gelu act and quant output");
+    m.def("gelu_and_quant",&gelu_and_quant, "Apply gelu act and quant output",
+        py::arg("out"),py::arg("input"),py::arg("scale_out"),py::arg("tmp"),py::arg("tanh") = true
+    );
 }

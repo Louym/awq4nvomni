@@ -3,12 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from awq.quantize import W8A8OF16LinearDynamicInputScale
-from llava.model.multimodal_encoder.siglip.modeling_siglip import (
-    SiglipMLP,
-    SiglipEncoder,
-    SiglipAttention,
-    SiglipEncoderLayer,
-)
 from tinychat.utils.input_metadata import ActivationBuffer
 from transformers.modeling_outputs import BaseModelOutput
 from typing import Optional, Tuple, Union
@@ -22,7 +16,7 @@ import awq_inference_engine
 
 
 class QuantSiglipEncoder(nn.Module):
-    def __init__(self, module: SiglipEncoder, bsz=64, seqlen=1024):
+    def __init__(self, module, bsz=64, seqlen=1024):
         super().__init__()
         self.config = module.config
         self.layers = [QuantSiglipEncoderLayer(layer) for layer in module.layers]
@@ -125,7 +119,7 @@ class QuantSiglipMLP(nn.Module):
 class QuantSiglipFlashAttention2(nn.Module):
     def __init__(
         self,
-        module: SiglipAttention,
+        module,
         init_only=False,
     ):
         super().__init__()
@@ -178,7 +172,7 @@ class QuantSiglipFlashAttention2(nn.Module):
 
 
 class QuantSiglipEncoderLayer(nn.Module):
-    def __init__(self, module: SiglipEncoderLayer):
+    def __init__(self, module):
         super().__init__()
         self.embed_dim = module.embed_dim
         self.self_attn = QuantSiglipFlashAttention2(module.self_attn)

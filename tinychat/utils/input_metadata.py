@@ -23,22 +23,25 @@ class ActivationBuffer:
     def __init__(self, model):
         self.model_class = model.__class__.__name__
 
-        if self.model_class == "SiglipEncoder":
+        if self.model_class in ["SiglipEncoder", "Qwen2AudioEncoder"]:
             self.model_dtype = model.layers[0].self_attn.k_proj.weight.dtype
             
         self.device = "cuda"
         assert self.model_class in [
-            "SiglipEncoder",
+            "SiglipEncoder", "Qwen2AudioEncoder"
         ], f"model_class: {self.model_class} is currently not supported."
         assert (
-            self.model_dtype == torch.float16
+            self.model_dtype == torch.float16 or self.model_dtype == torch.bfloat16
         ), f"model_dtype is expected to be fp16. Current: {self.model_dtype}."
-
-        self.intermediate_size = model.config.intermediate_size
-        self.hidden_size = model.config.hidden_size
+        if self.model_class == "SiglipEncoder":
+            self.intermediate_size = model.config.intermediate_size
+            self.hidden_size = model.config.hidden_size
+        elif self.model_class == "Qwen2AudioEncoder":
+            self.hidden_size = model.layers[0].self_attn.q_proj.out_features
+            self.intermediate_size = model.layers[0].fc1.out_features
 
     def allocate_activation_buffer(self, batched_seq_len):
-        if self.model_class == "SiglipEncoder":
+        if self.model_class in ["SiglipEncoder", "Qwen2AudioEncoder"]:
             self.__allocate_activation_buffer_siglip(batched_seq_len)
         else:
             raise NotImplementedError(

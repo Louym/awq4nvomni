@@ -27,10 +27,13 @@ __device__ __forceinline__ T gelu_fast(const T &x) {
   return ((T)0.5) * x * (((T)1.0) + t);
 }
 
-  
+template <typename T>
+__device__ __forceinline__ T gelu_precise(const T &x) {
+  return (T)0.5 * x * ((T)1.0 + (T)erff(x * (T)M_SQRT1_2)); // M_SQRT1_2 = 1/sqrt(2)
+} 
 
 // dequant int32 input, apply silu and mul, then per token quant to int8
-template <typename scale_type, bool use_per_token_quant>
+template <typename scale_type, bool use_per_token_quant, bool tanh>
 __global__ void gelu_and_quant_kernel(
     int8_t *__restrict__ out,          // [..., d]
     half *__restrict__ input, // [..., d]
@@ -47,7 +50,7 @@ __global__ void gelu_and_quant_kernel(
     for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
       const half x =
           (half)__ldg(&input[token_idx * d + idx]);
-      half t = gelu_fast(x);
+      half t=tanh? gelu_fast(x) : gelu_precise(x);
       tmp[token_idx * d + idx] = t;
       t = t > zero ? t : -t;
       if ((float)t > amax_val)
@@ -71,7 +74,8 @@ __global__ void gelu_and_quant_kernel(
     for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
       const float x =
           (float)__ldg(&input[token_idx * d + idx]);
-      out[token_idx * d + idx] = float_to_int8_rn((half)gelu_fast(x)  / scale_out[0]);
+      half t = tanh ? gelu_fast(x) : gelu_precise(x);
+      out[token_idx * d + idx] = float_to_int8_rn(t / scale_out[0]);      
     }
   }
 }
@@ -83,16 +87,26 @@ void gelu_and_quant(
     torch::Tensor &out,   // [..., d]
     torch::Tensor &input, // [..., d]
     torch::Tensor &scale_out, // [...]
-    torch::Tensor &tmp // [num_tokens, d]
+    torch::Tensor &tmp, // [num_tokens, d]
+    bool tanh
     ) {
   int64_t num_tokens = input.numel() / input.size(-1);
   int d = input.size(-1);
   dim3 grid(num_tokens);
   dim3 block(std::min(d, 128));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  vllm::gelu_and_quant_kernel<half, true><<<grid, block, 0, stream>>>(
-      out.data_ptr<int8_t>(), reinterpret_cast<half *>(input.data_ptr<at::Half>()), d, reinterpret_cast<half *>(scale_out.data_ptr<at::Half>()),reinterpret_cast<half *>(tmp.data_ptr<at::Half>()));
+  if (tanh)
+    vllm::gelu_and_quant_kernel<half, true, true><<<grid, block, 0, stream>>>(
+        out.data_ptr<int8_t>(), reinterpret_cast<half *>(input.data_ptr<at::Half>()), d, reinterpret_cast<half *>(scale_out.data_ptr<at::Half>()),reinterpret_cast<half *>(tmp.data_ptr<at::Half>()));
+  else
+  vllm::gelu_and_quant_kernel<half, true, false><<<grid, block, 0, stream>>>(
+        out.data_ptr<int8_t>(), reinterpret_cast<half *>(input.data_ptr<at::Half>()), d, reinterpret_cast<half *>(scale_out.data_ptr<at::Half>()),reinterpret_cast<half *>(tmp.data_ptr<at::Half>()));
 }
+
+
+
+
+
 
 
 

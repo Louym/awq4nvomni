@@ -141,57 +141,121 @@ def get_static_decoder_layer_scales(
 
     return decoder_layer_scales, act_dict
 
+@torch.no_grad()
+def get_act_scales_nvomni(
+        inferencer,
+        video_path,
+        num_video_frames,
+        audio_length="max_3600",
+    ):
+    inferencer.model.eval()
+    act_scales = {}
+
+    def stat_tensor(name, tensor):
+        hidden_dim = tensor.shape[-1]
+        tensor = tensor.view(-1, hidden_dim).abs().detach()
+        comming_max = torch.max(tensor, dim=0)[0].float().cpu()
+        if name in act_scales:
+            act_scales[name] = torch.max(act_scales[name], comming_max)
+        else:
+            act_scales[name] = comming_max
+
+    def stat_input_hook(m, x, y, name):
+        if isinstance(x, tuple):
+            x = x[0]
+        stat_tensor(name, x)
+
+    hooks = []
+    for name, m in inferencer.model.vision_tower.named_modules():
+        if isinstance(m, nn.Linear):
+            hooks.append(
+                m.register_forward_hook(functools.partial(stat_input_hook, name="VT."+name))
+            )
+    for name, m in inferencer.model.sound_tower.named_modules():
+        if isinstance(m, nn.Linear):
+            hooks.append(
+                m.register_forward_hook(functools.partial(stat_input_hook, name="AT."+name))
+            )
+    TEXT_PROMPT = "Assess the video, followed by a detailed description of it's video and audio contents."
+    inferencer.generate_response(
+        video_path=video_path,
+        text_prompt=TEXT_PROMPT,
+        num_video_frames=num_video_frames,
+        load_audio_in_video=True,
+        audio_length=audio_length,
+        max_new_tokens=1,
+    )
+    for h in hooks:
+        h.remove()
+
+    return act_scales
+
+
 
 def get_smooth_scale(model_path, media):
     # Load model
-    model = llava.load(model_path, devices=[0])
-    del model.llm
-    del model.mm_projector
-    torch.cuda.empty_cache()
-    model = model.cuda().eval()
-    prompt = []
-    if media is not None:
-        for m in media or []:
-            if any(m.endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                m = Image(m)
-            elif any(m.endswith(ext) for ext in [".mp4", ".mkv", ".webm"]):
-                m = Video(m)
+    if "nvila" in model_path.lower():
+        model = llava.load(model_path, devices=[0])
+        del model.llm
+        del model.mm_projector
+        torch.cuda.empty_cache()
+        model = model.cuda().eval()
+        prompt = []
+        if media is not None:
+            for m in media or []:
+                if any(m.endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
+                    m = Image(m)
+                elif any(m.endswith(ext) for ext in [".mp4", ".mkv", ".webm"]):
+                    m = Video(m)
+                else:
+                    raise ValueError(f"Unsupported media type: {m}")
+                prompt.append(m)
+        conversation = [{"from": "human", "value": prompt}]
+        media = extract_media(conversation, model.config)
+        for name in media:
+            if name == "image":
+                if (
+                    len(media["image"]) == 1
+                    and model.config.image_aspect_ratio == "dynamic"
+                ):
+                    model.config.image_processor = model.vision_tower.image_processor
+                    images = process_image(
+                        media["image"][0], model.config, None, enable_dynamic_res=True
+                    ).half()
+                    conversation[0]["value"] = conversation[0]["value"].replace(
+                        DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
+                    )
+                else:
+                    images = process_images(
+                        media["image"], model.vision_tower.image_processor, model.config
+                    ).half()
+                media[name] = [image for image in images]
+            elif name == "video":
+                media[name] = [
+                    process_images(
+                        images, model.vision_tower.image_processor, model.config
+                    ).half()
+                    for images in media[name]
+                ]
             else:
-                raise ValueError(f"Unsupported media type: {m}")
-            prompt.append(m)
-    conversation = [{"from": "human", "value": prompt}]
-    media = extract_media(conversation, model.config)
-    for name in media:
-        if name == "image":
-            if (
-                len(media["image"]) == 1
-                and model.config.image_aspect_ratio == "dynamic"
-            ):
-                model.config.image_processor = model.vision_tower.image_processor
-                images = process_image(
-                    media["image"][0], model.config, None, enable_dynamic_res=True
-                ).half()
-                conversation[0]["value"] = conversation[0]["value"].replace(
-                    DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
-                )
-            else:
-                images = process_images(
-                    media["image"], model.vision_tower.image_processor, model.config
-                ).half()
-            media[name] = [image for image in images]
-        elif name == "video":
-            media[name] = [
-                process_images(
-                    images, model.vision_tower.image_processor, model.config
-                ).half()
-                for images in media[name]
-            ]
-        else:
-            raise ValueError(f"Unsupported media type: {name}")
-    images = torch.cat(media["video"], dim=1)
-    model.vision_tower = model.vision_tower.eval()
-    decoder_layer_scales = get_act_scales(model.vision_tower, images)
-    return decoder_layer_scales
+                raise ValueError(f"Unsupported media type: {name}")
+        images = torch.cat(media["video"], dim=1)
+        model.vision_tower = model.vision_tower.eval()
+        smooth_scales = get_act_scales(model.vision_tower, images)
+    elif "nvomni" in model_path.lower():
+        from tinychat.models.nvomni.NVOmniVideo import NVOmniVideoInference
+        inferencer = NVOmniVideoInference(model_path, torch_dtype="torch.float16")
+        # Get scales
+        smooth_scales=get_act_scales_nvomni(
+            inferencer,
+            video_path=media[0],
+            num_video_frames=128,
+            audio_length="max_3600",
+        )
+        
+    else:
+        raise NotImplementedError("Model not supported.")
+    return smooth_scales
 
 
 @torch.no_grad()
@@ -236,11 +300,31 @@ def smooth_lm(model, scales, alpha=0.5):
                     module.self_attn.k_proj,
                     module.self_attn.v_proj,
                 ]
-                qkv_input_scales = scales[name + ".self_attn.q_proj"]
+                qkv_input_scales = scales["VT."+name + ".self_attn.q_proj"]
                 smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
 
                 ffn_ln = module.layer_norm2
                 fc1 = module.mlp.fc1
-                fc1_input_scales = scales[name + ".mlp.fc1"]
+                fc1_input_scales = scales["VT."+name + ".mlp.fc1"]
                 smooth_ln_fcs(ffn_ln, fc1, fc1_input_scales, alpha)
                 num += 1
+    elif "qwen2audiotower" in str(model.__class__).lower():
+        for name, module in model.named_modules():
+            if "qwen2audioencoderlayer" in str(module.__class__).lower():
+                attn_ln = module.self_attn_layer_norm
+                qkv = [
+                    module.self_attn.q_proj,
+                    module.self_attn.k_proj,
+                    module.self_attn.v_proj,
+                ]
+                qkv_input_scales = scales["AT."+name + ".self_attn.q_proj"]
+                smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
+
+                ffn_ln = module.final_layer_norm
+                fc1 = module.fc1
+                fc1_input_scales = scales["AT."+name + ".fc1"]
+                smooth_ln_fcs(ffn_ln, fc1, fc1_input_scales, alpha)  
+    else:
+        raise NotImplementedError(
+            f"Model {model.__class__} is not supported for SmoothQuant."
+        )

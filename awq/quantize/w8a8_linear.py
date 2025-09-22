@@ -183,7 +183,7 @@ class W8A8OF16LinearDynamicInputScale(W8A8OF16LinearStaticScale):
         q_linear = cls(
             q.in_features,
             q.out_features + k.out_features + v.out_features,
-            q.bias is not None,
+            q.bias is not None or k.bias is not None or v.bias is not None,
         )
         if init_only:  # just prepare for loading sd
             return q_linear
@@ -192,9 +192,15 @@ class W8A8OF16LinearDynamicInputScale(W8A8OF16LinearStaticScale):
         if s1_scale is None:
             s1_scale, _ = torch.max(abs(weight), dim=-1, keepdim=True)
             s1_scale = s1_scale.clamp_(min=1e-5).div_(127)
-
-        if q.bias is not None:
-            bias = torch.cat([q.bias, k.bias, v.bias], dim=0)
+        have_bias=q.bias is not None or k.bias is not None or v.bias is not None
+        if have_bias:
+            bias_list=[]
+            for linear in [q, k, v]:
+                if linear.bias is not None:
+                    bias_list.append(linear.bias)
+                else:
+                    bias_list.append(torch.zeros(linear.out_features, device=linear.weight.device, dtype=linear.weight.dtype))
+            bias = torch.cat(bias_list, dim=0)
             q_linear.bias = bias.clone().half().contiguous().cuda()
         # ---- Quantize the weights to int8 ---- #
         weight = weight.div_(s1_scale.to(weight.device))
