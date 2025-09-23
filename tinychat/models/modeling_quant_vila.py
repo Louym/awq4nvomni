@@ -377,7 +377,7 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
         attention_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time_list = []
-        for _ in range(20):
+        for _ in range(5):
             torch.cuda.synchronize()
             t1=time.time()
             results=VILAForCausalLM._embed(

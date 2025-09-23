@@ -7,6 +7,8 @@ from typing import List, Dict, Any, Optional, Union
 import logging
 import sys
 from awq.quantize.smooth import smooth_lm
+import tinychat.utils.constants
+tinychat.utils.constants.max_seq_len = 70*1024
 from tinychat.models.modeling_quant_vila import NVOmniVideoInference
 os.environ["HF_HUB_OFFLINE"] = "1"  # Use local cache for models
 from tinychat.models import QuantVILAForCausalLM
@@ -205,12 +207,13 @@ def main():
     """Main function demonstrating usage of the NVOmni model."""
     
     # Configuration
-    MODEL_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/nvOmni-deployment"
-    VIDEO_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/videos/draw.mp4"
+    MODEL_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/models/nvOmni-8B"
+    VIDEO_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/models/elon_musk.mp4"
+    # "/FirstIntelligence/home/yuming/workspace/nvomni/videos/draw.mp4"
     # TEXT_PROMPT = "Describe this video based on the audio."
     TEXT_PROMPT = "What did the person say? Is the person male or female?"
     quant_llm=False
-    quant_tower=False
+    quant_tower=True
     num_video_frames=128
     audio_length="max_3600"
     load_audio_in_video=True
@@ -253,7 +256,9 @@ def main():
     inferencer.model = inferencer.model.to("cuda:0")
     # Generate response
     logger.info("Starting inference...")
-    
+    # import cupyx
+    # with cupyx.profiler.profile():
+
     response = inferencer.benchmark(
         video_path=VIDEO_PATH,
         text_prompt=TEXT_PROMPT,
@@ -264,6 +269,7 @@ def main():
         # temperature=0.7,
         # top_p=0.9
     )
+    torch.cuda.synchronize()
     if response:
         print("\n" + "="*60)
         print("GENERATED RESPONSE")

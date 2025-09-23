@@ -1548,7 +1548,7 @@ class VILAForCausalLM(VILAPretrainedModel):
                 # print("name: ", name, "media[name]: ", media[name], "len(media[name]): ", len(media[name]))
                 # print(media_config)
                 time_list=[]
-                for i in range(20):
+                for i in range(1):
                     torch.cuda.synchronize()
                     start_time = time.time()
                     if len(media[name]) > 0:

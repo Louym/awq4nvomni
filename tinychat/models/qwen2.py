@@ -164,7 +164,7 @@ class Qwen2AttentionFused(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
-        self.kv_max_seq_len = min(max_seq_len, self.max_position_embeddings)
+        self.kv_max_seq_len = max(max_seq_len, self.max_position_embeddings)
         # following fastertransformer definition
         self.cache_v = (
             torch.zeros(
