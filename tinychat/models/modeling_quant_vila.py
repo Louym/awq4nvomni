@@ -3,7 +3,12 @@ import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import logging
-from transformers import AutoProcessor, AutoModel, AutoConfig, GenerationConfig, AutoTokenizer, PretrainedConfig
+import whisper
+import numpy as np
+from itertools import chain
+from .nvomni.distributed import all_gather as vila_all_gather
+from collections import OrderedDict, defaultdict, deque
+from transformers import AutoProcessor, AutoModel, AutoConfig, GenerationConfig, AutoTokenizer, PretrainedConfig, WhisperFeatureExtractor
 from .nvomni.modeling_vila import (
     VILAPretrainedModel,
     VILAForCausalLM,
@@ -366,7 +371,229 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
     #     # Pad sequences to the longest one in the batch
     #     return self.__batchify_sequence(inputs, labels)
     
-    
+    def _VILAForCausalLM__embed_media_tokens(
+        self,
+        media: Dict[str, List[torch.Tensor]],
+        media_config: Dict[str, Dict[str, Any]],
+        mm_info,
+    ) -> Dict[str, List[torch.Tensor]]:
+        embeds = defaultdict(deque)
+
+        if self.config.unified_audio_encoder:
+            assert len(media["speech"]) == 0
+
+        for name in media:
+            _encoder = self.encoders[name]
+            if name in ["speech", "sound"] and self.config.unified_audio_encoder:
+                _encoder = self.encoders["sound"]
+
+            if self.training:
+                 # Gather metainfo of media objects from all ranks
+                if name in ["speech", "sound"]:
+
+                    info = []
+                    if type(media.get(name, {})) is dict:
+                        for _dict in media.get(name, {}):
+                            info.append({k: {"shape": v.shape, "dtype": v.dtype} for k, v in _dict.items()})
+                    elif type(media.get(name, {})) is list:
+                        info = [{"shape": tensor.shape, "dtype": tensor.dtype} for tensor in media.get(name, [])]
+                    else:
+                        raise ValueError(f"Unsupported media type: {type(media.get(name, {}))}")
+
+                    # infos = list(chain(*distributed.all_gather(info)))
+                    infos_list = vila_all_gather(info)
+                    infos = list(chain(*infos_list))
+
+                    # The entire batch does not contain any media objects of this type.
+                    if not infos:
+                        continue
+
+                    # for audio encoding, we have to ensure the batch size is the same for all ranks. If not, we need to pad the batch with dummy tensors to the max batch size
+                    max_batch_size = max(len(_info) for _info in infos_list)
+                    missing_batch_size = max_batch_size - len(info)
+
+                    _media = media.get(name, [])
+
+                    _medias = list(chain(vila_all_gather(_media)))
+                    if missing_batch_size > 0:
+                        for i in range(missing_batch_size):
+                            # use one of the media tensors to create a dummy tensor
+                            if type(media.get(name, {})) is dict:
+                                _dummy = {k: v.clone().to(device=self.device) for k, v in _medias[0].items()}
+                            elif type(media.get(name, {})) is list:
+                                if type(_medias[0]) is torch.Tensor:
+                                    _dummy = _medias[0].clone().to(device=self.device)
+                                elif type(_medias[0]) is np.ndarray:
+                                    _dummy = _medias[0].copy()
+                                else:
+                                    raise ValueError(f"Unsupported media type: {type(_medias[0])}")
+                            else:
+                                raise ValueError(f"Unsupported media type: {type(media.get(name, {}))}")
+                            _media.append(_dummy)
+                            mm_info["audio_info"].append(["dummy"])
+                    # print(f"rank {torch.distributed.get_rank()}: {name}, len of info: {len(info)}, len of infos: {len(infos)}, missing_batch_size: {missing_batch_size}")
+
+                    # we need to also align the length of all audio samples in the batch size
+                    cur_batch_max_audio_samples = max(len(_audio) for _audio in _medias)
+                    cur_batch_max_audio_samples = int(np.ceil(cur_batch_max_audio_samples  / (self.config.audio_sampling_rate * 30)) * (self.config.audio_sampling_rate * 30)) # should be multiple of 30 seconds
+                    cur_batch_max_audio_samples = min(cur_batch_max_audio_samples, self.config.audio_chunk_length * self.config.audio_sampling_rate)
+                    cur_batch_max_audio_duration = cur_batch_max_audio_samples // self.config.audio_sampling_rate
+
+                    whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                        "Qwen/Qwen2.5-Omni-7B", chunk_length=cur_batch_max_audio_duration, sampling_rate=self.config.audio_sampling_rate, hop_length=self.config.audio_hop_length
+                    )
+
+                    # use WhisperFeatureExtractor in transformers to load
+                    new_media = []
+
+                    aud_idx = 0
+                    for _batch_idx in range(len(mm_info["audio_info"])):
+                        _audio_info = mm_info["audio_info"][_batch_idx]
+                        if _audio_info is not None:
+                            for _mm_idx in range(len(_audio_info)):
+                                _audio = _media[aud_idx]
+                                if type(_audio) is torch.Tensor:
+                                    device = _audio.device
+                                    dtype = _audio.dtype
+                                    _audio = _audio.cpu().float()
+                                else:
+                                    # logger.warning(f"The audio type is not a tensor, which is unexpected. Using the device and dtype of the model. media: {media}, mm_info: {mm_info}")
+                                    device = self.device
+                                    dtype = self.dtype
+                                _audio = whisper.pad_or_trim(_audio, length=cur_batch_max_audio_samples)
+                                aud_idx += 1
+                                stft_features = whisper_feature_extractor(
+                                    _audio,
+                                    sampling_rate=self.config.audio_sampling_rate,
+                                    return_attention_mask=True,
+                                    padding="max_length",
+                                    return_tensors="pt",
+                                ).to(device, dtype)
+                                new_media.append(stft_features)
+                                if _audio_info[_mm_idx] != "dummy":
+                                    _audio_info[_mm_idx]["new_audio_chunk_length"] = cur_batch_max_audio_duration
+                                    _audio_info[_mm_idx]["new_audio_n_samples"] = cur_batch_max_audio_samples
+                                    _audio_info[_mm_idx]["audio_end_sample_sec"] = _audio_info[_mm_idx]["audio_start_sec"] + cur_batch_max_audio_duration
+                                    _audio_info[_mm_idx]["new_audio_n_stft_frames"] = stft_features["input_features"].shape[-1]
+
+                    assert aud_idx == len(_media), "The number of audio info does not match the number of audio samples."
+                    _media = new_media
+
+                    _fea = _encoder(_media, media_config[name], mm_info)
+                    # [751, 1536]
+                    # consume dummy features later
+                    _dummy_fea = _fea[len(info) :]
+                    embeds["dummy"].extend(_dummy_fea)
+
+                    # remove the dummy features
+                    _real_fea = _fea[: len(info)]
+                    if len(info) > 0:
+                        embeds[name] = deque(_real_fea)
+
+                else:
+                    # Gather metainfo of media objects from all ranks
+                    info = [{"shape": tensor.shape, "dtype": tensor.dtype} for tensor in media.get(name, [])]
+                    infos = list(chain(vila_all_gather(info)))
+
+                    # The entire batch does not contain any media objects of this type.
+                    if not infos:
+                        continue
+
+                    # Create a dummy tensor to ensure the encoder is called, otherwise the training will hang.
+                    if media.get(name) is None or len(media[name]) == 0:
+                        dummy = torch.zeros(infos[0]["shape"], dtype=infos[0]["dtype"], device=self.device)
+                        embeds["dummy"].extend(self.encoders[name]([dummy], media_config[name]))
+                        continue
+                    embeds[name] = deque(self.encoders[name](media[name], media_config[name]))
+
+            else:
+                torch.cuda.synchronize()
+                _encoder_time_start = time.time()
+                if name == "sound":
+                    all_audio_chunk_lengths = []
+                    for _sample_idx in range(len(media[name])):
+                        for _mm_idx in range(len(mm_info["audio_info"][_sample_idx])):
+                            _new_audio_chunk_length = mm_info["audio_info"][_sample_idx][_mm_idx]["new_audio_chunk_length"]
+                            all_audio_chunk_lengths.append(_new_audio_chunk_length)
+                    cur_batch_max_audio_duration = max(all_audio_chunk_lengths)
+                    cur_batch_max_audio_samples = cur_batch_max_audio_duration * self.config.audio_sampling_rate
+                    # for qwen omni audio
+                    # cur_batch_max_audio_samples = 960000
+
+                    whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                            "Qwen/Qwen2.5-Omni-7B", chunk_length=cur_batch_max_audio_duration, sampling_rate=self.config.audio_sampling_rate, hop_length=self.config.audio_hop_length
+                    )
+                    new_media = []
+                    _idx = 0
+                    assert len(all_audio_chunk_lengths) == len(media[name]), "The number of audio chunk lengths does not match the number of audio samples."
+
+                    _media = media.get(name, [])
+                    aud_idx = 0
+                    for _batch_idx in range(len(mm_info["audio_info"])):
+                        _audio_info = mm_info["audio_info"][_batch_idx]
+                        if _audio_info is not None:
+                            for _mm_idx in range(len(_audio_info)):
+                                _audio = _media[aud_idx]
+                                if type(_audio) is torch.Tensor:
+                                    device = _audio.device
+                                    dtype = _audio.dtype
+                                    _audio = _audio.cpu().float()
+                                else:
+                                    # logger.warning(f"The audio type is not a tensor, which is unexpected. Using the device and dtype of the model. media: {media}, mm_info: {mm_info}")
+                                    device = self.device
+                                    dtype = self.dtype
+                                _audio = whisper.pad_or_trim(_audio, length=cur_batch_max_audio_samples)
+                                aud_idx += 1
+                                # print("audio shape: ", _audio.shape, "cur_batch_max_audio_samples: ", cur_batch_max_audio_samples, mm_info["audio_info"])
+                                stft_features = whisper_feature_extractor(
+                                    _audio,
+                                    sampling_rate=self.config.audio_sampling_rate,
+                                    return_attention_mask=True,
+                                    padding="max_length",
+                                    return_tensors="pt",
+                                ).to(device, dtype)
+
+                                # log_file = "audio_shapes_log.txt"
+                                # # 将信息追加写入文件
+                                # shape1 = stft_features["input_features"].shape
+                                # shape2 = stft_features["attention_mask"].shape
+                                # with open(log_file, "a", encoding="utf-8") as file:
+                                #     file.write(
+                                #         f"audio shape: {_audio.shape} cur_batch_max_audio_samples: {cur_batch_max_audio_samples} "
+                                #         f"{mm_info} {shape1} {shape2}\n"
+                                #     )
+                                # print("audio shape: ", _audio.shape, "cur_batch_max_audio_samples: ", cur_batch_max_audio_samples, mm_info["audio_info"],stft_features["input_features"].shape, stft_features["attention_mask"].shape)
+                                new_media.append(stft_features)
+                                if _audio_info[_mm_idx] != "dummy":
+                                    _audio_info[_mm_idx]["new_audio_chunk_length"] = cur_batch_max_audio_duration
+                                    _audio_info[_mm_idx]["new_audio_n_samples"] = cur_batch_max_audio_samples
+                                    _audio_info[_mm_idx]["audio_end_sample_sec"] = _audio_info[_mm_idx]["audio_start_sec"] + cur_batch_max_audio_duration
+                                    _audio_info[_mm_idx]["new_audio_n_stft_frames"] = stft_features["input_features"].shape[-1]
+                    media[name] = new_media
+                    # print("len new_media: ", len(new_media))
+                    
+                # print("name: ", name, "media[name]: ", media[name], "len(media[name]): ", len(media[name]))
+                # print(media_config)
+                if len(media[name]) > 0:
+                    # torch.cuda.synchronize()
+                    # _encoder_time_end = time.time()
+                    # print(name, "encoder time: ", _encoder_time_end - _encoder_time_start)
+                    embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
+                    torch.cuda.synchronize()
+                    _encoder_time_end = time.time()
+                    print(name, "encoder time: ", _encoder_time_end - _encoder_time_start)
+                # time_list=[]
+                # for i in range(10):
+                #     torch.cuda.synchronize()
+                #     start_time = time.time()
+                #     if len(media[name]) > 0:
+                #         embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
+                #     torch.cuda.synchronize()
+                #     end_time = time.time()
+                #     time_list.append(end_time - start_time)
+                # print(f"Encoding media '{name}' took {np.mean(time_list):.4f} seconds")
+        # print(embeds)
+        return embeds
     
     def _embed(
         self,
@@ -377,7 +604,7 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
         attention_mask: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         time_list = []
-        for _ in range(5):
+        for _ in range(1):
             torch.cuda.synchronize()
             t1=time.time()
             results=VILAForCausalLM._embed(

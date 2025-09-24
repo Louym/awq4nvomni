@@ -1547,16 +1547,18 @@ class VILAForCausalLM(VILAPretrainedModel):
                     
                 # print("name: ", name, "media[name]: ", media[name], "len(media[name]): ", len(media[name]))
                 # print(media_config)
-                time_list=[]
-                for i in range(1):
-                    torch.cuda.synchronize()
-                    start_time = time.time()
-                    if len(media[name]) > 0:
-                        embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
-                    torch.cuda.synchronize()
-                    end_time = time.time()
-                    time_list.append(end_time - start_time)
-                print(f"Encoding media '{name}' took {np.mean(time_list):.4f} seconds")
+                if len(media[name]) > 0:
+                    embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
+                # time_list=[]
+                # for i in range(10):
+                #     torch.cuda.synchronize()
+                #     start_time = time.time()
+                #     if len(media[name]) > 0:
+                #         embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
+                #     torch.cuda.synchronize()
+                #     end_time = time.time()
+                #     time_list.append(end_time - start_time)
+                # print(f"Encoding media '{name}' took {np.mean(time_list):.4f} seconds")
         # print(embeds)
         return embeds
 

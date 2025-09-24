@@ -8,7 +8,7 @@ import logging
 import sys
 from awq.quantize.smooth import smooth_lm
 import tinychat.utils.constants
-tinychat.utils.constants.max_seq_len = 70*1024
+tinychat.utils.constants.max_seq_len = 4*1024
 from tinychat.models.modeling_quant_vila import NVOmniVideoInference
 os.environ["HF_HUB_OFFLINE"] = "1"  # Use local cache for models
 from tinychat.models import QuantVILAForCausalLM
@@ -207,15 +207,17 @@ def main():
     """Main function demonstrating usage of the NVOmni model."""
     
     # Configuration
-    MODEL_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/models/nvOmni-8B"
-    VIDEO_PATH = "/FirstIntelligence/home/yuming/workspace/nvomni/models/elon_musk.mp4"
-    # "/FirstIntelligence/home/yuming/workspace/nvomni/videos/draw.mp4"
+    MODEL_PATH = "/home/yuming/workspace/nvomni/nvOmni-8B"
+    VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk8.mp4"
+    VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk_trimmed_16s.mp4"
+    # VIDEO_PATH = "/home/yuming/workspace/nvomni/draw.mp4"
     # TEXT_PROMPT = "Describe this video based on the audio."
-    TEXT_PROMPT = "What did the person say? Is the person male or female?"
+    TEXT_PROMPT = "Assess the video, followed by a detailed description of it's video and audio contents.  What is the person saying?"
+    # TEXT_PROMPT = "Tell me a joke"
     quant_llm=False
-    quant_tower=True
-    num_video_frames=128
-    audio_length="max_3600"
+    quant_tower=False
+    num_video_frames=32
+    audio_length=16
     load_audio_in_video=True
 
     add_to_sys_path_direct(MODEL_PATH)
@@ -223,11 +225,11 @@ def main():
     # Initialize the inference class
     logger.info("Initializing NVOmni Video Inference...")
     if quant_llm:
-        quant_path="/FirstIntelligence/home/yuming/workspace/nvomni/quant_cache/nvomni-8B-w4-g128-v2.pt"
+        quant_path="/home/yuming/workspace/nvomni/awq4nvomni/quant_cache/nvomni-8B-w4-g128-v2.pt"
     else:
         quant_path=None
     if quant_tower:
-        smooth_scale_path="/FirstIntelligence/home/yuming/workspace/nvomni/awq_cache/nvomni-smooth-scale.pt"
+        smooth_scale_path="/home/yuming/workspace/nvomni/awq4nvomni/awq_cache/nvomni-smooth-scale.pt"
     else:
         smooth_scale_path=None
     inferencer = QuantNVOmniVideoInference(
@@ -238,37 +240,30 @@ def main():
         alpha=0.3, 
         device_map="auto"
         )
-    
+    audio_chunk_length = audio_length
+    inferencer.model.config.audio_chunk_length = f"fix {audio_chunk_length}"
     if inferencer.model is None:
         logger.error("Failed to initialize model. Exiting.")
         return
     print(inferencer.model)
     inferencer.model = inferencer.model.cuda().eval()
     
-    
-    from awq.quantize.quantizer import real_quantize_model_weight
-    from tinychat.modules import (
-        make_quant_norm,
-        make_quant_attn,
-        make_fused_mlp,
-        make_fused_vision_attn,
-    )
     inferencer.model = inferencer.model.to("cuda:0")
     # Generate response
     logger.info("Starting inference...")
     # import cupyx
     # with cupyx.profiler.profile():
-
-    response = inferencer.benchmark(
-        video_path=VIDEO_PATH,
-        text_prompt=TEXT_PROMPT,
-        num_video_frames=num_video_frames,
-        load_audio_in_video=load_audio_in_video,
-        audio_length=audio_length,
-        max_new_tokens=1024,
-        # temperature=0.7,
-        # top_p=0.9
-    )
+    for i in range(5):
+        response = inferencer.benchmark(
+            video_path=VIDEO_PATH,
+            text_prompt=TEXT_PROMPT,
+            num_video_frames=num_video_frames,
+            load_audio_in_video=load_audio_in_video,
+            audio_length=audio_length,
+            max_new_tokens=1024,
+            # temperature=0.7,
+            # top_p=0.9
+        )
     torch.cuda.synchronize()
     if response:
         print("\n" + "="*60)
@@ -279,20 +274,6 @@ def main():
     else:
         logger.error("Failed to generate response")
     
-    # Example of batch processing
-    if False:
-        logger.info("\nExample: Batch processing")
-        batch_pairs = [
-            (VIDEO_PATH, "What is happening in this video?"),
-            (VIDEO_PATH, "Describe the audio content of this video."),
-        ]
-        
-        batch_responses = inferencer.batch_generate(batch_pairs, max_new_tokens=128)
-        
-        for i, (pair, response) in enumerate(zip(batch_pairs, batch_responses)):
-            print(f"\n--- Batch Response {i+1} ---")
-            print(f"Prompt: {pair[1]}")
-            print(f"Response: {response}")
 
 if __name__ == "__main__":
     main()

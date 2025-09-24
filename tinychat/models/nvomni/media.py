@@ -20,7 +20,7 @@ import tarfile
 import whisper
 import decord
 from decord import AudioReader, cpu
-
+import torchaudio
 from transformers import PretrainedConfig
 
 # from llava.constants import MEDIA_TOKENS
@@ -367,7 +367,34 @@ def _whisper_process(audio, sample_rate, audio_chunk_length, max_chunks_per_file
 
     frames = torch.stack(outputs, dim=0)
     return frames.numpy().tolist()
+def _waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
+    # Based on https://github.com/YuanGongND/ast/blob/d7d8b4b8e06cdaeb6c843cdb38794c1c7692234c/src/dataloader.py#L102
+    waveform -= waveform.mean()
+    fbank = torchaudio.compliance.kaldi.fbank(
+        waveform,
+        htk_compat=True,
+        sample_frequency=sample_rate,
+        use_energy=False,
+        window_type="hanning",
+        num_mel_bins=num_mel_bins,
+        dither=0.0,
+        frame_length=25,
+        frame_shift=0,
+    )
+    # Convert to [mel_bins, num_frames] shape
+    fbank = fbank.transpose(0, 1)
+    # Pad to target_length
+    n_frames = fbank.size(1)
+    p = target_length - n_frames
 
+    # cut and pad
+    if p > 0:
+        fbank = torch.nn.functional.pad(fbank, (0, p), mode="constant", value=0)
+    elif p < 0:
+        fbank = fbank[:, 0:target_length]
+
+    fbank = fbank.unsqueeze(0)
+    return fbank
 def _load_speech(speech, config: PretrainedConfig):
     if PROFILE_MODE:
         time_0 = time.time()
@@ -383,14 +410,23 @@ def _load_speech(speech, config: PretrainedConfig):
         return None
     speech_outputs = []
 
-    if config.audio_chunk_length and not (type(config.audio_chunk_length) == str and "max" in config.audio_chunk_length):
+    if config.audio_chunk_length and not (type(config.audio_chunk_length) == str and "max" in config.audio_chunk_length) and not (type(config.audio_chunk_length) == str and "fix" in config.audio_chunk_length):
         try:
             config.audio_chunk_length = int(config.audio_chunk_length)
+            audio_n_samples_limit = config.audio_chunk_length * config.audio_sampling_rate
         except Exception as e:
             print(f"Error setting audio_chunk_length: {e}")
             raise e
+    else:
+        audio_n_samples_limit = None # not set here
 
-    audio_n_samples_limit = config.audio_chunk_length * config.audio_sampling_rate
+    load_fix_audio = type(config.audio_chunk_length) == str and "fix" in config.audio_chunk_length
+
+    if load_fix_audio:
+        audio_chunk_length = int(config.audio_chunk_length.split("_")[1])
+        audio_n_samples_limit = audio_chunk_length * config.audio_sampling_rate
+    else:
+        audio_chunk_length = config.audio_chunk_length
 
     def load_wav(speech_path):
         # speech = whisper.load_audio(speech_path, sr=config.audio_sampling_rate)
@@ -412,6 +448,7 @@ def _load_speech(speech, config: PretrainedConfig):
 
 
         load_max_audio = type(config.audio_chunk_length) == str and "max" in config.audio_chunk_length
+
         if hasattr(config, 'random_audio_sample') and not load_max_audio:
             if ori_n_samples > audio_n_samples:
                 audio_start_sample_id = random.randint(0, ori_n_samples - audio_n_samples)
@@ -482,13 +519,19 @@ def _load_speech(speech, config: PretrainedConfig):
     speech = speech.astype(np.float32)
     # speech = whisper.pad_or_trim(speech, length=cur_max_length) # this will leads to dis-sync issue in audio tower, where the audio tower futher split and process the feature sequence
 
+    # Make the audio length a multiple of 30 seconds
     # if type(config.audio_chunk_length) == str and "max" in config.audio_chunk_length:
     #     audio_n_samples = int(np.ceil(speech.shape[0] / (config.audio_sampling_rate * 30)) * (config.audio_sampling_rate * 30))
     # else:
     #     audio_n_samples = speech.shape[0]
-    audio_n_samples = int(np.ceil(speech.shape[0] / (config.audio_sampling_rate * 30)) * (config.audio_sampling_rate * 30))
 
-    speech = whisper.pad_or_trim(speech, length=audio_n_samples) # we don't pad or trim here, instead, we pad based on the max length of all audio samples in the batch size later
+    if not load_fix_audio:
+        audio_n_samples = int(np.ceil(speech.shape[0] / (config.audio_sampling_rate * 30)) * (config.audio_sampling_rate * 30))
+    else:
+        # debug
+        audio_n_samples = audio_chunk_length * config.audio_sampling_rate
+
+    speech = whisper.pad_or_trim(speech, length=audio_n_samples) # we will also pad based on the max length of all audio samples in the batch size later
 
     new_audio_chunk_length = int(audio_n_samples // config.audio_sampling_rate)
     # if config.audio_chunk_length == "max":
@@ -505,11 +548,80 @@ def _load_speech(speech, config: PretrainedConfig):
     audio_info['audio_start_sec'] = audio_start_sec
     audio_info['audio_end_sample_sec'] = audio_end_sample_sec
 
+    # calculate the time of each audio sample
+    # audio_info['audio_sample_times'] = []
+    # for i in range(audio_n_samples):
+    #     audio_info['audio_sample_times'].append(i / config.audio_sampling_rate)
+
+    if False:
+        # speech = whisper.load_audio(speech_path)
+        # print(f"new loader speech shape: {speech.shape}")
+        speech = whisper.pad_or_trim(speech, length=4800000)
+        mel = whisper.log_mel_spectrogram(speech, n_mels=128)
+        # print(f"new loader mel shape: {speech.shape}")
+        speech_outputs.append(mel)
+        speech_frames = speech_outputs[0]  # torch.stack(speech_outputs, dim=0)
+        return speech_frames.numpy().tolist()
+
+    if False: # we do stft later after we align the length of all audio samples in the batch size
+        whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            "Qwen/Qwen2.5-Omni-7B", chunk_length=new_audio_chunk_length, sampling_rate=config.audio_sampling_rate
+        )
+
+    if False:
+        whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained("/lustre/fsw/portfolios/adlr/users/sreyang/flamingo_v2/NV-Whisper",  chunk_length=config.audio_chunk_length, sampling_rate=config.audio_sampling_rate)
+
+        # use WhisperFeatureExtractor in transformers to load
+        speech_features = whisper_feature_extractor(
+            speech,
+            sampling_rate=config.audio_sampling_rate,
+            return_attention_mask=True,
+            padding="max_length",
+            return_tensors="pt",
+            hop_length=config.audio_hop_length,
+        )
+        if "attention_mask" not in speech_features:
+            return None
+
+    if False:
+        whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained("/lustre/fsw/portfolios/adlr/users/sreyang/flamingo_v2/NV-Whisper",  chunk_length=config.audio_chunk_length, sampling_rate=config.audio_sampling_rate)
+
+        # use WhisperFeatureExtractor in transformers to load
+        speech_features = whisper_feature_extractor(
+            speech,
+            sampling_rate=config.audio_sampling_rate,
+            return_attention_mask=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        if "attention_mask" not in speech_features:
+            return None
+
+
     if PROFILE_MODE:
         time_3 = time.time()
-        print(f"[Rank {rank}] audio load_speech time: {time_3 - time_0}. Audio length: {audio_info['ori_audio_duration']}. speech_path: {speech_path}")
+        logger.warning(f"[Rank {rank}] audio load_speech time: {time_3 - time_0}. Audio length: {audio_info['ori_audio_duration']}. speech_path: {speech_path}")
         time_0 = time.time()
     return speech, audio_info
+
+
+_load_sound = _load_speech
+
+# def _load_sound(sound_path: str):
+#     # Load video frames from a directory
+#     if sound_path is None:
+#         return None
+#     sound_outputs = []
+#     try:
+#         sound = whisper.load_audio(sound_path)
+#         sound = whisper.pad_or_trim(sound)
+#         mel = whisper.log_mel_spectrogram(sound, n_mels=128)
+#         sound_outputs.append(mel.unsqueeze(0))
+#     except:
+#         sound_outputs.append(torch.zeros(1,128,30000))
+#     sound_frames = torch.stack(sound_outputs, dim=0)
+#     return sound_frames.numpy().tolist()
+
 
 def _extract_speech(speech: Speech, config: PretrainedConfig):
     frames, audio_info = _load_speech(speech, config)

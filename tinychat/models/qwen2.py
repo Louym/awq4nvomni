@@ -480,7 +480,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM):
     def benchmark(self, inputs_embeds, attention_mask, max_output=128, quant_llm=True):
         output_list = []
         start_pos = 0
-        for i in range(10):
+        for i in range(1):
             torch.cuda.synchronize()
             tst = time.time()
             token = self.forward(None, start_pos, inputs_embeds, quant=quant_llm)
