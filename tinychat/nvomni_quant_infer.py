@@ -12,6 +12,7 @@ tinychat.utils.constants.max_seq_len = 4*1024
 from tinychat.models.modeling_quant_vila import NVOmniVideoInference
 os.environ["HF_HUB_OFFLINE"] = "1"  # Use local cache for models
 from tinychat.models import QuantVILAForCausalLM
+from tinychat.models.nvomni.media import Video
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ class QuantNVOmniVideoInference(NVOmniVideoInference):
         # except Exception as e:
         #     logger.error(f"Failed to load model: {str(e)}")
         #     return False
-    
+
     @torch.inference_mode()    
     def benchmark(
         self, 
@@ -108,7 +109,7 @@ class QuantNVOmniVideoInference(NVOmniVideoInference):
         do_sample: bool = None,
         num_video_frames: int = -1,
         load_audio_in_video: bool = True,
-        audio_length: Union[int, str] = "max_3600",
+        audio_length: Union[int, str] = "fix_8",
     ) -> Optional[str]:
         """
         Generate a response from the model given a video and text prompt.
@@ -172,6 +173,7 @@ class QuantNVOmniVideoInference(NVOmniVideoInference):
             logger.info(f"Input processing completed in {processing_time:.2f} seconds")
             
             logger.info("Generating response...")
+            torch.cuda.synchronize()
             start_time = time.time()
 
 
@@ -182,9 +184,9 @@ class QuantNVOmniVideoInference(NVOmniVideoInference):
                     media_config=getattr(inputs, 'media_config', None),
                     generation_config=None,
                 )
-            
+            torch.cuda.synchronize()
             generation_time = time.time() - start_time
-            logger.info(f"Generation completed in {generation_time:.2f} seconds")
+            logger.info(f"Generation completed in {generation_time:.5f} seconds")
             
             # Decode response
             response = self.processor.tokenizer.batch_decode(
@@ -197,10 +199,43 @@ class QuantNVOmniVideoInference(NVOmniVideoInference):
             #     response = response[len(text):].strip()
             
             return response
+    @torch.inference_mode()    
+    def benchmark_content(
+        self, 
+        video_path: str, 
+        text_prompt: str,
+    ) -> Optional[str]:
+        """
+        Generate a response from the model given a video and text prompt.
+        
+        Args:
+            video_path (str): Path to the video file
+            text_prompt (str): Text prompt for the model
+            max_new_tokens (int): Maximum number of new tokens to generate
+            temperature (float): Sampling temperature
+            top_p (float): Top-p sampling parameter
+            do_sample (bool): Whether to use sampling
+            custom_generation_config (GenerationConfig): Custom generation configuration
             
-        # except Exception as e:
-        #     logger.error(f"Error during generation: {str(e)}")
-        #     return None
+        Returns:
+            Optional[str]: Generated response or None if failed
+        """
+        video=Video(video_path)
+        logger.info("Generating response...")
+        start_time = time.time()
+
+
+        with torch.no_grad():
+            response = self.model.benchmark_content(
+                prompt=[video, text_prompt],
+                generation_config=None,
+            )
+        
+        generation_time = time.time() - start_time
+        logger.info(f"Generation completed in {generation_time:.2f} seconds")
+            
+        return response
+   
     
     
 def main():
@@ -208,16 +243,18 @@ def main():
     
     # Configuration
     MODEL_PATH = "/home/yuming/workspace/nvomni/nvOmni-8B"
-    VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk8.mp4"
-    VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk_trimmed_16s.mp4"
+    VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk2.mp4"
+    # VIDEO_PATH = "/home/yuming/workspace/nvomni/elon_musk_trimmed_16s.mp4"
     # VIDEO_PATH = "/home/yuming/workspace/nvomni/draw.mp4"
     # TEXT_PROMPT = "Describe this video based on the audio."
-    TEXT_PROMPT = "Assess the video, followed by a detailed description of it's video and audio contents.  What is the person saying?"
-    # TEXT_PROMPT = "Tell me a joke"
-    quant_llm=False
-    quant_tower=False
-    num_video_frames=32
-    audio_length=16
+    # TEXT_PROMPT = "Assess the video, followed by a detailed description of it's video and audio contents.  What is the person saying?"
+    TEXT_PROMPT = "Describe what happens in this video in detail."
+    quant_llm=True
+    quant_tower=True
+    # quant_llm=False
+    # quant_tower=False
+    video_length=2
+    audio_length=video_length
     load_audio_in_video=True
 
     add_to_sys_path_direct(MODEL_PATH)
@@ -240,8 +277,10 @@ def main():
         alpha=0.3, 
         device_map="auto"
         )
+    num_video_frames = int(2 * video_length)
+    inferencer.model.config.num_video_frames = num_video_frames
     audio_chunk_length = audio_length
-    inferencer.model.config.audio_chunk_length = f"fix {audio_chunk_length}"
+    inferencer.model.config.audio_chunk_length = f"fix_{audio_chunk_length}"
     if inferencer.model is None:
         logger.error("Failed to initialize model. Exiting.")
         return
@@ -254,15 +293,10 @@ def main():
     # import cupyx
     # with cupyx.profiler.profile():
     for i in range(5):
-        response = inferencer.benchmark(
+        response = inferencer.benchmark_content(
             video_path=VIDEO_PATH,
             text_prompt=TEXT_PROMPT,
-            num_video_frames=num_video_frames,
-            load_audio_in_video=load_audio_in_video,
-            audio_length=audio_length,
-            max_new_tokens=1024,
-            # temperature=0.7,
-            # top_p=0.9
+            
         )
     torch.cuda.synchronize()
     if response:

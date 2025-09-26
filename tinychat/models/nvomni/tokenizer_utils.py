@@ -72,8 +72,8 @@ def tokenize_conversation_legacy(
 def tokenize_conversation(
     messages: Sequence[Dict[str, str]],
     tokenizer: transformers.PreTrainedTokenizer,
-    mm_use_bos_eos_tokens: bool,
-    unified_audio_encoder: bool,
+    mm_use_bos_eos_tokens: bool = True,
+    unified_audio_encoder: bool = True,
     add_generation_prompt: bool = False,
     overrides: Optional[Dict[str, str]] = None,
     no_system_prompt: bool = False,

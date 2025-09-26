@@ -53,7 +53,7 @@ from .distributed import all_gather as vila_all_gather
 from .loss import soft_cross_entropy
 from .media import extract_media
 from .media_encoder import BasicImageEncoder, BasicVideoEncoder, TSPVideoEncoder, BasicSoundEncoder, CacheFeatures
-from .mm_utils import process_image, process_images
+from .mm_utils import process_image, process_images  
 from .model_utils_packing import set_seqlens_in_batch
 from .siglip_encoder import SiglipVisionTower, SiglipVisionTowerDynamicS2, SiglipVisionTowerS2
 from .tokenizer_utils import tokenize_conversation
@@ -1409,6 +1409,7 @@ class VILAForCausalLM(VILAPretrainedModel):
                     # print(f"rank {torch.distributed.get_rank()}: {name}, len of info: {len(info)}, len of infos: {len(infos)}, missing_batch_size: {missing_batch_size}")
 
                     # we need to also align the length of all audio samples in the batch size
+                    
                     cur_batch_max_audio_samples = max(len(_audio) for _audio in _medias)
                     cur_batch_max_audio_samples = int(np.ceil(cur_batch_max_audio_samples  / (self.config.audio_sampling_rate * 30)) * (self.config.audio_sampling_rate * 30)) # should be multiple of 30 seconds
                     cur_batch_max_audio_samples = min(cur_batch_max_audio_samples, self.config.audio_chunk_length * self.config.audio_sampling_rate)

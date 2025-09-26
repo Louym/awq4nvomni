@@ -7,7 +7,11 @@ import whisper
 import numpy as np
 from itertools import chain
 from .nvomni.distributed import all_gather as vila_all_gather
+from .nvomni.constants import DEFAULT_IMAGE_TOKEN
+from .nvomni.tokenizer_utils import tokenize_conversation
 from collections import OrderedDict, defaultdict, deque
+from .nvomni.mm_utils import process_image, process_images 
+from .nvomni.media import extract_media
 from transformers import AutoProcessor, AutoModel, AutoConfig, GenerationConfig, AutoTokenizer, PretrainedConfig, WhisperFeatureExtractor
 from .nvomni.modeling_vila import (
     VILAPretrainedModel,
@@ -189,188 +193,6 @@ class QuantVILAPretrainedModel(VILAPretrainedModel):
 class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
     def __init__(self, config: VILAConfig, quant_path=None, *args, **kwargs):
         QuantVILAPretrainedModel.__init__(self, config, quant_path, *args, **kwargs)
-    
-    
-    # def _embed(
-    #     self,
-    #     input_ids: torch.Tensor,
-    #     media: Dict[str, List[torch.Tensor]],
-    #     media_config: Dict[str, Dict[str, Any]],
-    #     labels: Optional[torch.Tensor],
-    #     attention_mask: Optional[torch.Tensor],
-    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #     # NOTE(ligeng): deep copy to avoid modifying the original media and media_config
-    #     media = copy.deepcopy(media)
-    #     media_config = copy.deepcopy(media_config)
-
-    #     labels = labels if labels is not None else torch.full_like(input_ids, IGNORE_INDEX)
-    #     attention_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
-
-    #     PROCESS_GROUP_MANAGER = get_pg_manager()
-    #     if PROCESS_GROUP_MANAGER is not None:
-    #         for name in media:
-    #             self.encoders[name].end_tokens = None
-
-    #     # Extract text and media embeddings
-    #     text_embeds = self.llm_model_embed_tokens(input_ids)
-
-    #     mm_info = {}
-    #     if "video_info" in media:
-    #         video_info = media["video_info"]
-    #         del media["video_info"]
-    #         mm_info['video_info'] = video_info
-    #     else:
-    #         video_info = None
-
-    #     if "audio_info" in media:
-    #         audio_info = media["audio_info"]
-    #         del media["audio_info"]
-    #         mm_info['audio_info'] = audio_info
-    #     else:
-    #         audio_info = None
-
-    #     if media is not None:
-    #         media_embeds = self.__embed_media_tokens(media, media_config, mm_info)
-    #     else:
-    #         # no media was provided, so we just return an empty dict
-    #         media_embeds = {}
-
-    #     if PROCESS_GROUP_MANAGER is not None:
-    #         media_embeds_video = []
-    #         for i, images in enumerate(media_embeds["video"]):
-    #             num_video_frame = media["video"][i].shape[0]
-    #             if False:  # self.encoders["video"].pool_sizes:
-    #                 pool_size = self.encoders["video"].pool_sizes[0][0]
-    #                 num_video_frame = num_video_frame // pool_size * pool_size
-    #             media_embeds_video += torch.unbind(images.reshape(num_video_frame, -1, images.shape[-1]))
-    #         media_embeds["video"] = deque(media_embeds_video)
-
-    #     # This is a workaround to make sure the dummy embeddings are consumed
-    #     while media_embeds.get("dummy"):
-    #         dummy_embed = media_embeds["dummy"].popleft()
-    #         text_embeds += torch.sum(dummy_embed) * 0
-
-    #     # Based on segment_aud_indices_list and segment_vis_indices_list, get interleaved vis-aud embeddings for video
-    #     video_sound_embeds_idx = 0
-    #     sep_embed = self.encoders["video"].embed_tokens("\n")
-    #     text_embeds = text_embeds.to(self.dtype)
-    #     sep_embed = sep_embed.to(text_embeds.dtype)
-        
-    #     if video_info is not None and self.config.load_audio_in_video and self.config.interleaved_vis_aud_in_video:
-    #         assert self.encoders["video"].end_tokens is None, "end_tokens must be None for interleaved vis-aud in video"
-    #         new_video_embeds = deque()
-    #         video_embeds_idx = 0
-    #         for k in range(len(video_info)):
-    #             if video_info[k] is None:
-    #                 continue
-    #             for i in range(len(video_info[k])):
-    #                 has_audio = video_info[k][i]["has_audio"]
-    #                 if not has_audio:
-    #                     new_video_embeds.append(media_embeds["video"][video_embeds_idx])
-    #                     video_embeds_idx += 1
-    #                     continue
-
-    #                 # Check bounds for sound embeddings
-    #                 if video_sound_embeds_idx >= len(media_embeds["sound"]):
-    #                     raise ValueError(f"Sound embeddings index {video_sound_embeds_idx} out of bounds for video_info[{k}][{i}]")
-
-    #                 segment_aud_indices_list = video_info[k][i]["segment_aud_indices_list"]
-    #                 segment_vis_indices_list = video_info[k][i]["segment_vis_indices_list"]
-
-    #                 # vis_t_pool_size = self.encoders["video"].pool_sizes[0][0]
-    #                 vis_fea_len_per_frame =  media_embeds["video"][video_embeds_idx].shape[0] / video_info[k][i]["expected_frame_count"]
-    #                 # aud_fea_len_per_sample =  media_embeds["sound"][video_sound_embeds_idx].shape[0] / video_info[k][i]["expected_audio_count"]
-    #                 aud_fea_len_per_stft_frame =  media_embeds["sound"][video_sound_embeds_idx].shape[0] / audio_info[k][i]["new_audio_n_stft_frames"]
-    #                 vis_end = 0
-    #                 aud_end = 0
-    #                 _new_video_embed = []
-    #                 for j in range(len(segment_vis_indices_list)):
-    #                     _vis_aud_fea = []
-    #                     if len(segment_vis_indices_list[j]) > 0:
-    #                         _new_frames = [int(np.ceil((_frame+1) * vis_fea_len_per_frame)) for _frame in segment_vis_indices_list[j]]
-    #                         _vis_fea_end = _new_frames[-1]
-    #                         # Ensure we don't exceed the available features
-    #                         _vis_fea_end = min(_vis_fea_end, media_embeds["video"][video_embeds_idx].shape[0])
-    #                         if j == len(segment_vis_indices_list) - 1 and i == len(video_info) - 1 and k == len(video_info[i]) - 1 and not _vis_fea_end == media_embeds["video"][video_embeds_idx].shape[0]: 
-    #                             print(f"Warning: The number of last interleaved video features does not match the video feature length. Expected: {media_embeds['video'][video_embeds_idx].shape[0]}, Got: {_vis_fea_end}")
-    #                             _vis_fea_end = media_embeds["video"][video_embeds_idx].shape[0]
-    #                         _vis_fea = media_embeds["video"][video_embeds_idx][vis_end:_vis_fea_end]
-    #                         vis_end = _vis_fea_end
-    #                         _vis_aud_fea.append(_vis_fea)
-    #                     _vis_aud_fea.append(sep_embed)
-    #                     if len(segment_aud_indices_list[j]) > 0:
-    #                         _new_audio_indices = [int(np.ceil(_fea * aud_fea_len_per_stft_frame)) for _fea in segment_aud_indices_list[j]]
-    #                         _aud_fea_end = _new_audio_indices[-1]
-    #                         # Ensure we don't exceed the available features
-    #                         _aud_fea_end = min(_aud_fea_end, media_embeds["sound"][video_sound_embeds_idx].shape[0])
-    #                         _aud_fea = media_embeds["sound"][video_sound_embeds_idx][aud_end:_aud_fea_end]
-    #                         _vis_aud_fea.append(_aud_fea)
-    #                         aud_end = _aud_fea_end
-    #                     _vis_aud_fea.append(sep_embed)
-    #                     _new_video_embed.append(torch.cat(_vis_aud_fea, dim=0))
-    #                 video_sound_embeds_idx += 1
-    #                 new_video_embeds.append(torch.cat(_new_video_embed, dim=0))
-    #                 video_embeds_idx += 1
-
-    #         assert len(new_video_embeds) == len(media_embeds["video"]), "The number of new video embeddings does not match the number of original video embeddings."
-    #         media_embeds["video"] = new_video_embeds
-    #     # Remove padding
-    #     batch_size = labels.shape[0]
-    #     text_embeds = [text_embeds[k][attention_mask[k]] for k in range(batch_size)]
-    #     labels = [labels[k][attention_mask[k]] for k in range(batch_size)]
-    #     # Build inverse mapping from token ID to media name
-    #     media_tokens = {}
-    #     for name, token_id in self.tokenizer.media_token_ids.items():
-    #         media_tokens[token_id] = name
-
-    #     # Fuse text and media embeddings
-    #     inputs_m, labels_m = [], []
-    #     sound_embeds_idx = 0
-    #     for k in range(batch_size):
-    #         inputs_mk, labels_mk = [], []
-    #         pos = 0
-    #         while pos < len(labels[k]):
-    #             if input_ids[k][pos].item() in media_tokens:
-    #                 name = media_tokens[input_ids[k][pos].item()] if PROCESS_GROUP_MANAGER is None else "video"
-    #                 if input_ids[k][pos].item() == self.tokenizer.media_token_ids["sound"]:
-    #                     if self.config.interleaved_vis_aud_in_video:
-    #                         if sound_embeds_idx < video_sound_embeds_idx:
-    #                             media_embeds[name].popleft()
-    #                             sound_embeds_idx += 1
-    #                             pos += 1
-    #                             continue
-    #                     sound_embeds_idx += 1
-
-    #                 end = pos + 1
-    #                 input = media_embeds[name].popleft()
-    #                 label = torch.full([input.shape[0]], IGNORE_INDEX, device=labels[k].device, dtype=labels[k].dtype)
-    #             else:
-    #                 end = pos
-    #                 while end < len(labels[k]) and input_ids[k][end].item() not in media_tokens:
-    #                     end += 1
-    #                 input = text_embeds[k][pos:end]
-    #                 label = labels[k][pos:end]
-                
-    #             inputs_mk.append(input)
-    #             labels_mk.append(label)
-    #             pos = end
-    #         inputs_m.append(torch.cat(inputs_mk, dim=0))
-    #         labels_m.append(torch.cat(labels_mk, dim=0))
-    #     inputs, labels = inputs_m, labels_m
-
-    #     inputs[0] += sep_embed.mean() * 0 # dummy embedding
-    #     # Check if all media embeddings are consumed
-
-    #     for name in media_embeds:
-    #         if media_embeds[name]:
-    #             raise ValueError(f"Not all {name} embeddings are consumed! Still {len(media_embeds[name])} left.")
-
-    #     # Truncate sequences to `model_max_length` as media embeddings are inserted
-    #     inputs, labels = self.__truncate_sequence(inputs, labels)
-
-    #     # Pad sequences to the longest one in the batch
-    #     return self.__batchify_sequence(inputs, labels)
-    
     def _VILAForCausalLM__embed_media_tokens(
         self,
         media: Dict[str, List[torch.Tensor]],
@@ -522,7 +344,7 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
 
                     whisper_feature_extractor = WhisperFeatureExtractor.from_pretrained(
                             "Qwen/Qwen2.5-Omni-7B", chunk_length=cur_batch_max_audio_duration, sampling_rate=self.config.audio_sampling_rate, hop_length=self.config.audio_hop_length
-                    )
+                    )                   
                     new_media = []
                     _idx = 0
                     assert len(all_audio_chunk_lengths) == len(media[name]), "The number of audio chunk lengths does not match the number of audio samples."
@@ -552,7 +374,6 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
                                     padding="max_length",
                                     return_tensors="pt",
                                 ).to(device, dtype)
-
                                 # log_file = "audio_shapes_log.txt"
                                 # # 将信息追加写入文件
                                 # shape1 = stft_features["input_features"].shape
@@ -562,7 +383,6 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
                                 #         f"audio shape: {_audio.shape} cur_batch_max_audio_samples: {cur_batch_max_audio_samples} "
                                 #         f"{mm_info} {shape1} {shape2}\n"
                                 #     )
-                                # print("audio shape: ", _audio.shape, "cur_batch_max_audio_samples: ", cur_batch_max_audio_samples, mm_info["audio_info"],stft_features["input_features"].shape, stft_features["attention_mask"].shape)
                                 new_media.append(stft_features)
                                 if _audio_info[_mm_idx] != "dummy":
                                     _audio_info[_mm_idx]["new_audio_chunk_length"] = cur_batch_max_audio_duration
@@ -581,7 +401,7 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
                     embeds[name] = deque(_encoder(media[name], media_config[name], mm_info))
                     torch.cuda.synchronize()
                     _encoder_time_end = time.time()
-                    print(name, "encoder time: ", _encoder_time_end - _encoder_time_start)
+                    print(name, "encoder time: ", _encoder_time_end - _encoder_time_start, "shape: ", embeds[name][0].shape)
                 # time_list=[]
                 # for i in range(10):
                 #     torch.cuda.synchronize()
@@ -621,30 +441,7 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
         print(f"embed time: {sum(time_list)/len(time_list)}")
         return results
     
-    # def __embed_media_tokens(
-    #     self,
-    #     media: Dict[str, List[torch.Tensor]],
-    #     media_config: Dict[str, Dict[str, Any]],
-    #     mm_info,
-    # ) -> Dict[str, List[torch.Tensor]]:
-    #     time_list = []
-    #     for _ in range(20):
-    #         torch.cuda.synchronize()
-    #         t1=time.time()
-    #         results=VILAForCausalLM._VILAForCausalLM__embed_media_tokens(
-    #             self,
-    #             media,
-    #             media_config,
-    #             mm_info,
-    #         )
-    #         torch.cuda.synchronize()
-    #         t2=time.time()
-    #         time_list.append(t2-t1)
-    #         print(t2-t1)
-    #     print(f"embed time: {sum(time_list)/len(time_list)} s")
-    #     return results
-
-        
+   
 
     def benchmark(        
         self,
@@ -672,6 +469,114 @@ class QuantVILAForCausalLM(VILAForCausalLM, QuantVILAPretrainedModel):
                 return_value = torch.cat([input_ids, output_ids], dim=-1)
 
         return return_value
+    @torch.inference_mode()
+    def benchmark_content(
+        self,
+        prompt: Union[str, List],
+        generation_config: Optional[GenerationConfig] = None,
+        response_format=None,
+    ) -> str:
+        # TODO(zhijianl): Support directly taking conversation as input
+        conversation = [{"from": "human", "value": prompt}]
+
+        # Convert response format to logits processor
+        xgr_logits_processor = None
+
+        # Extract media from the conversation
+
+        # TODO (extract and preprocess should be done together, as the preprocess of image and video can be different, i.e. when dynamic res is used)
+        media = extract_media(conversation, self.config)
+
+        # Process media
+        media_config = defaultdict(dict)
+        for name in media:
+            if name == "image":
+                if len(media["image"]) == 1 and self.config.image_aspect_ratio in ["dynamic", "dynamic_s2"]:
+                    self.config.image_processor = self.vision_tower.image_processor
+                    if self.config.image_aspect_ratio == "dynamic":
+                        images = process_image(media["image"][0], self.config, None, enable_dynamic_res=True).half()
+                        conversation[0]["value"] = conversation[0]["value"].replace(
+                            DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
+                        )
+                    else:
+                        if type(self.config.s2_scales) is str:
+                            self.config.s2_scales = list(map(int, self.config.s2_scales.split(",")))
+                        images, block_sizes = process_image(
+                            media["image"][0], self.config, None, enable_dynamic_s2=True
+                        )
+                        images = images.half()
+                        media_config[name]["block_sizes"] = [block_sizes]
+                else:
+                    images = process_images(media["image"], self.vision_tower.image_processor, self.config).half()
+                media[name] = [image for image in images]
+            elif name == "video":
+                if self.config.image_aspect_ratio == "dynamic" and self.config.video_max_tiles > 1:
+                    media[name] = [
+                        process_images(
+                            images,
+                            self.vision_tower.image_processor,
+                            self.config,
+                            enable_dynamic_res=True,
+                            max_tiles=self.config.video_max_tiles,
+                        ).half()
+                        for images in media[name]
+                    ]
+                elif self.config.image_aspect_ratio == "dynamic_s2" and self.config.video_max_tiles > 1:
+                    self.config.image_processor = self.vision_tower.image_processor
+                    if type(self.config.s2_scales) is str:
+                        self.config.s2_scales = list(map(int, self.config.s2_scales.split(",")))
+                    media[name] = [
+                        torch.cat(
+                            [
+                                process_image(
+                                    image,
+                                    self.config,
+                                    None,
+                                    enable_dynamic_s2=True,
+                                    max_tiles=self.config.video_max_tiles,
+                                )[0].half()
+                                for image in images
+                            ]
+                        )
+                        for images in media[name]
+                    ]
+                else:
+                    media[name] = [
+                        process_images(images, self.vision_tower.image_processor, self.config)
+                        for images in media[name]
+                    ]
+            elif name == "speech":
+                speeches = media["speech"]
+                media[name] = [speech for speech in speeches]
+            elif name == "sound":
+                # sounds = process_sounds(media["sound"]).half()
+                sounds = media["sound"]
+                # media[name] = [{k: v.half() for sound in sounds for k, v in sound.items()]
+                for sound in sounds:
+                    if type(sound) is dict:
+                        for k, v in sound.items():
+                            sound[k] = v.half()
+                media[name] = [sound for sound in sounds]
+            elif name == "video_info":
+                media[name] = [media["video_info"]]
+            elif name == "audio_info":
+                media[name] = [media["audio_info"]]
+            else:
+                raise ValueError(f"Unsupported media type: {name}")
+
+        # Tokenize the conversation
+        input_ids = tokenize_conversation(conversation, self.tokenizer, add_generation_prompt=True).unsqueeze(0).cuda()
+
+        output_ids = self.benchmark(
+                input_ids=input_ids,
+                media=media,
+                media_config=media_config,
+                logits_processor=xgr_logits_processor,  # structured generation
+            )
+
+        # Decode the response
+        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        return response
     
     
 def add_to_sys_path_direct(model_path):

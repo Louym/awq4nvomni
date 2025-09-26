@@ -10,69 +10,53 @@ import io
 import cv2
 import kaldiio
 import librosa
-import soundfile as sf
-import torch
 import numpy as np
 import PIL
 import PIL.Image
 import requests
-import tarfile
+import soundfile as sf
+import torch
 import whisper
 import decord
 from decord import AudioReader, cpu
-import torchaudio
-from transformers import PretrainedConfig
+from librosa import resample as librosa_resample
+from pytorchvideo.data.clip_sampling import ConstantClipsPerVideoSampler, UniformClipSampler
+from transformers import PretrainedConfig, WhisperFeatureExtractor
+import json
 
-# from llava.constants import MEDIA_TOKENS
-# from llava.media import Image, Video
-# from llava.utils import make_list
-# from llava.utils.logging import logger
+from .constants import MEDIA_TOKENS
+from .utils import make_list
 
+# from xvila_utils.profile.profile_flag import PROFILE_MODE
+PROFILE_MODE=False
+cv2.setNumThreads(0) 
 
-MEDIA_TOKENS = {
-    "image": "<image>",
-    "video": "<vila/video>",
-    "speech": "<speech>",
-    "sound": "<sound>",
-}
-
-PROFILE_MODE = False
-PROFILE_PROFILER_MODE = False
-
+# from llava.utils.cache_features import _load_cached_features, CacheFeatures
 class Media:
     pass
-
-
 class File(Media):
     def __init__(self, path: str) -> None:
         self.path = path
-
-
 class Image(File):
     pass
-
-
 class Video(File):
     pass
-
 class Speech(File):
-    def __init__(self, path, extension: str = None) -> None:
-        self.path = path
-        self.extension = extension
-
+    pass
 class Sound(File):
-    def __init__(self, path, extension: str = None) -> None:
-        self.path = path
-        self.extension = extension
+    pass
+__all__ = ["extract_media"]
 
-
-def make_list(obj: Any) -> List:
-    return obj if isinstance(obj, list) else [obj]
+load_no_video = False
+if load_no_video:
+    print("Warning: media.py load_no_video is True! Only for debug.")
 
 
 def _extract_image(image: Union[Image, PIL.Image.Image]) -> PIL.Image.Image:
     if isinstance(image, Image):
-        if image.path.startswith("http://") or image.path.startswith("https://"):
+        if isinstance(image.path, PIL.Image.Image):
+            image = image.path
+        elif image.path.startswith("http://") or image.path.startswith("https://"):
             image = PIL.Image.open(requests.get(image.path, stream=True).raw)
         else:
             image = PIL.Image.open(image.path)
@@ -80,12 +64,21 @@ def _extract_image(image: Union[Image, PIL.Image.Image]) -> PIL.Image.Image:
 
 
 def _load_video_bytesio(
-    video_bytesio: BytesIO, *, num_frames: int, config: PretrainedConfig, load_aud: bool = False
+    video_bytesio: BytesIO, *, num_frames: int, config: PretrainedConfig, load_aud: bool = False, sample_name: int = None
 ) -> List[PIL.Image.Image]:
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as temp_video:
-        temp_video.write(video_bytesio.read())
-        temp_video_name = temp_video.name
-        return _load_video(temp_video_name, num_frames=num_frames, load_aud=load_aud, config=config)
+    assert sample_name is not None, "sample_name is not set"
+
+    tmp_name = f"tmp_video_{sample_name}.mp4"
+    tmp_path = os.path.join("/tmp", tmp_name)
+    # with tempfile.NamedTemporaryFile(delete=True, suffix=".mp4") as temp_video:
+    #     temp_video.write(video_bytesio.read())
+    #     temp_video_name = temp_video.name
+    #     return _load_video(temp_video_name, num_frames=num_frames, load_aud=load_aud, config=config)
+    with open(tmp_path, "wb") as f:
+        f.write(video_bytesio.read())
+    out = _load_video(tmp_path, num_frames=num_frames, load_aud=load_aud, config=config)
+    os.remove(tmp_path)
+    return out
 
 def get_overlap(inp1, inp2):
     """
@@ -112,18 +105,34 @@ def get_overlap(inp1, inp2):
 def _load_video(
     video_path: str, *, num_frames: int, config: PretrainedConfig, load_aud: bool = False
 ) -> List[PIL.Image.Image]:
+
+    if PROFILE_MODE:
+        rank = torch.distributed.get_rank()
+        time_0 = time.time()
+
     # Load video frames from a directory
     if os.path.isdir(video_path):
         frame_paths = sorted(glob.glob(os.path.join(video_path, "*")))
         indices = np.round(np.linspace(0, len(frame_paths) - 1, num_frames)).astype(int)
         return [PIL.Image.open(frame_paths[index]) for index in indices]
 
+    # # Check for cached features first
+    # if hasattr(config, "load_cached_features") and config.load_cached_features:
+    #     cached_data, load_cache = _load_cached_features(video_path, config)
+    #     if load_cache:
+    #         if PROFILE_MODE:
+    #             time_1 = time.time()
+    #             logger.warning(f"[Rank {rank}] video load_cached_features time: {time_1 - time_0}. video_path: {video_path}")
+    #             time_0 = time.time()
+    #         # Return dummy frames since we have cached features
+    #         # The actual features will be loaded during encoding
+    #         # dummy_frames = [PIL.Image.new("RGB", (224, 224), (0, 0, 0)) for _ in range(num_frames)]
+    #         return cached_data["video"], cached_data["audio"], cached_data["video"].value["video_info"]
+
     # Load video frames from a video file
 
-    if PROFILE_MODE:
-        rank = torch.distributed.get_rank()
-        time_0 = time.time()
-
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file '{video_path}' does not exist.")
     vidcap = cv2.VideoCapture(video_path)
 
     # load audio if available and needed
@@ -131,11 +140,13 @@ def _load_video(
     if load_aud:
         # if True:
         try:
-            aud_feature, audio_info = _load_speech(video_path, config)
+            aud_feature, audio_info = _load_sound(video_path, config)
             if PROFILE_MODE:
                 time_1 = time.time()
+                logger.warning(f"[Rank {rank}] video load_sound time: {time_1 - time_0}. video_path: {video_path}")
                 time_0 = time.time()
         except Exception as e:
+            logger.warning(f"Failed to load audio from video '{video_path}'. Error: {e}")
             aud_feature = None
     else:
         aud_feature = None
@@ -192,6 +203,7 @@ def _load_video(
         # audio_samples_per_second = aud_feas.shape[-1] / audio_info['new_audio_chunk_length']
 
         stft_frames_per_second = config.audio_sampling_rate // config.audio_hop_length
+        audio_info["stft_frames_per_second"] = stft_frames_per_second
 
         _idx = 0
         aud_sample_start_idx = 0
@@ -222,7 +234,7 @@ def _load_video(
         vidcap.set(cv2.CAP_PROP_POS_FRAMES, index)
         success, frame = vidcap.read()
         if not success:
-            print(f"Failed to read frame {index} from video '{video_path}'. Skipped.")
+            logger.warning(f"Failed to read frame {index} from video '{video_path}'. Skipped.")
             continue
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frames[index] = PIL.Image.fromarray(frame)
@@ -230,7 +242,7 @@ def _load_video(
 
     if PROFILE_MODE:
         time_2 = time.time()
-        print(f"[Rank {rank}] video load frames time: {time_2 - time_0}. Video length: {video_duration}. video_path: {video_path}")
+        logger.warning(f"[Rank {rank}] video load frames time: {time_2 - time_0}. Video length: {video_duration}. video_path: {video_path}")
         time_0 = time.time()
 
     output_frames = [frames[index] for index in indices if index in frames]
@@ -248,8 +260,8 @@ def _load_video(
                     new_segment_vis_indices_list[-1].append(processed_frame_index)
                     processed_frame_index += 1
             # seg_vis_aud = {"frame_indices": new_segment_vis_indices_list[-1], "aud_indices": segment_aud_indices_list[i]}
+            # vis_aud_segments.append(seg_vis_aud) # not used
         segment_vis_indices_list = new_segment_vis_indices_list
-        # vis_aud_segments.append(seg_vis_aud)
 
         video_info["segment_vis_indices_list"] = segment_vis_indices_list
         video_info["segment_aud_indices_list"] = segment_aud_indices_list
@@ -273,11 +285,11 @@ def _extract_video(video: Video, config: PretrainedConfig) -> List[PIL.Image.Ima
     aud_fea = None
 
     if getattr(config, "fps") != 0:
-        print("Extracting frames from video with specified FPS is not supported yet. Ignored.")
+        logger.warning("Extracting frames from video with specified FPS is not supported yet. Ignored.")
 
     if isinstance(video.path, BytesIO):
         frames, aud_fea, video_info = _load_video_bytesio(
-            video.path, num_frames=num_frames, config=config, load_aud=config.load_audio_in_video
+            video.path, num_frames=num_frames, config=config, load_aud=config.load_audio_in_video, sample_name=video.sample_name
         )
     else:
         frames, aud_fea, video_info = _load_video(
@@ -287,7 +299,7 @@ def _extract_video(video: Video, config: PretrainedConfig) -> List[PIL.Image.Ima
     if config.load_audio_in_video:
         return frames, aud_fea, video_info
     else:
-        return frames
+        return frames, video_info
 
 
 def soundFile_read_audio(audio_file, offset=None, duration=None, dtype='float32'):
@@ -367,34 +379,7 @@ def _whisper_process(audio, sample_rate, audio_chunk_length, max_chunks_per_file
 
     frames = torch.stack(outputs, dim=0)
     return frames.numpy().tolist()
-def _waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
-    # Based on https://github.com/YuanGongND/ast/blob/d7d8b4b8e06cdaeb6c843cdb38794c1c7692234c/src/dataloader.py#L102
-    waveform -= waveform.mean()
-    fbank = torchaudio.compliance.kaldi.fbank(
-        waveform,
-        htk_compat=True,
-        sample_frequency=sample_rate,
-        use_energy=False,
-        window_type="hanning",
-        num_mel_bins=num_mel_bins,
-        dither=0.0,
-        frame_length=25,
-        frame_shift=0,
-    )
-    # Convert to [mel_bins, num_frames] shape
-    fbank = fbank.transpose(0, 1)
-    # Pad to target_length
-    n_frames = fbank.size(1)
-    p = target_length - n_frames
 
-    # cut and pad
-    if p > 0:
-        fbank = torch.nn.functional.pad(fbank, (0, p), mode="constant", value=0)
-    elif p < 0:
-        fbank = fbank[:, 0:target_length]
-
-    fbank = fbank.unsqueeze(0)
-    return fbank
 def _load_speech(speech, config: PretrainedConfig):
     if PROFILE_MODE:
         time_0 = time.time()
@@ -524,15 +509,12 @@ def _load_speech(speech, config: PretrainedConfig):
     #     audio_n_samples = int(np.ceil(speech.shape[0] / (config.audio_sampling_rate * 30)) * (config.audio_sampling_rate * 30))
     # else:
     #     audio_n_samples = speech.shape[0]
-
     if not load_fix_audio:
         audio_n_samples = int(np.ceil(speech.shape[0] / (config.audio_sampling_rate * 30)) * (config.audio_sampling_rate * 30))
     else:
         # debug
         audio_n_samples = audio_chunk_length * config.audio_sampling_rate
-
     speech = whisper.pad_or_trim(speech, length=audio_n_samples) # we will also pad based on the max length of all audio samples in the batch size later
-
     new_audio_chunk_length = int(audio_n_samples // config.audio_sampling_rate)
     # if config.audio_chunk_length == "max":
     #     config.audio_chunk_length = int(audio_n_samples // config.audio_sampling_rate)
@@ -626,8 +608,54 @@ _load_sound = _load_speech
 def _extract_speech(speech: Speech, config: PretrainedConfig):
     frames, audio_info = _load_speech(speech, config)
     return frames, audio_info
-
 _extract_sound = _extract_speech
+
+# def _extract_sound(sound: Sound, config: PretrainedConfig):
+#     frames = _load_sound(sound, config)
+#     return frames
+
+
+def _waveform2melspec(waveform, sample_rate, num_mel_bins, target_length):
+    # Based on https://github.com/YuanGongND/ast/blob/d7d8b4b8e06cdaeb6c843cdb38794c1c7692234c/src/dataloader.py#L102
+    waveform -= waveform.mean()
+    fbank = torchaudio.compliance.kaldi.fbank(
+        waveform,
+        htk_compat=True,
+        sample_frequency=sample_rate,
+        use_energy=False,
+        window_type="hanning",
+        num_mel_bins=num_mel_bins,
+        dither=0.0,
+        frame_length=25,
+        frame_shift=DEFAULT_AUDIO_FRAME_SHIFT_MS,
+    )
+    # Convert to [mel_bins, num_frames] shape
+    fbank = fbank.transpose(0, 1)
+    # Pad to target_length
+    n_frames = fbank.size(1)
+    p = target_length - n_frames
+
+    # cut and pad
+    if p > 0:
+        fbank = torch.nn.functional.pad(fbank, (0, p), mode="constant", value=0)
+    elif p < 0:
+        fbank = fbank[:, 0:target_length]
+
+    fbank = fbank.unsqueeze(0)
+    return fbank
+
+
+def _get_clip_timepoints(clip_sampler, duration):
+    # Read out all clips in this video
+    all_clips_timepoints = []
+    is_last_clip = False
+    end = 0.0
+    while not is_last_clip:
+        start, end, _, _, is_last_clip = clip_sampler(end, duration, annotation=None)
+        all_clips_timepoints.append((float(start), float(end)))
+    return all_clips_timepoints
+
+
 def extract_media(
     messages: List[Dict[str, Any]],
     config: Optional[PretrainedConfig] = None,
@@ -644,9 +672,9 @@ def extract_media(
         text = ""
         for part in make_list(message["value"]):
             if isinstance(part, str):
-                for token in MEDIA_TOKENS.values():
+                for token in ["<video>"] + list(MEDIA_TOKENS.values()):
                     if token in part:
-                        print(f"Media token '{token}' found in text: '{part}'. Removed.")
+                        logger.warning(f"Media token '{token}' found in text: '{part}'. Removed.")
                         part = part.replace(token, "").strip()
                 text += part
             elif isinstance(part, (Image, PIL.Image.Image)):
@@ -659,19 +687,22 @@ def extract_media(
                 if draft:
                     media["video"].append(part)
                 else:
-                    # media["video"].append(_extract_video(part, config))
                     if config.load_audio_in_video:
                         output, aud_fea, video_info = _extract_video(part, config)
-                        media["video"].append(output)
-                        media["video_info"].append(video_info)
+                        if not load_no_video:
+                            media["video"].append(output)
+                            media["video_info"].append(video_info)
                         if aud_fea is not None:
                             media["sound"].append(aud_fea)
                             media["audio_info"].append(video_info['audio_info'])
                             text += MEDIA_TOKENS["sound"]
                     else:
-                        output = _extract_video(part, config)
-                        media["video"].append(output)
-                text += MEDIA_TOKENS["video"]
+                        output, video_info = _extract_video(part, config)
+                        if not load_no_video:
+                            media["video"].append(output)
+                            media["video_info"].append(video_info)
+                if not load_no_video:
+                    text += MEDIA_TOKENS["video"]
             elif isinstance(part, Speech):
                 if draft:
                     if config.unified_audio_encoder:
@@ -705,4 +736,12 @@ def extract_media(
                 print(f"part: {part}")
                 raise ValueError(f"Unsupported prompt part type: {type(part)}")
         message["value"] = text
+
+    # audio_info_len = len([_ for _ in media["audio_info"] if _ is not None]) if "audio_info" in media else 0
+    # audio_len = len([_ for _ in media["sound"] if _ is not None]) if "sound" in media else 0
+    # if audio_info_len != audio_len:
+    #     print(f"Error: audio_info_len: {audio_info_len}, audio_len: {audio_len} \nmessages: {messages}")
+    #     print(f"Error: media: {media}")
+    #     raise ValueError(f"audio_info_len: {audio_info_len}, audio_len: {audio_len}")
+
     return media

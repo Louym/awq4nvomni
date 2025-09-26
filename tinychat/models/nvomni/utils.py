@@ -217,3 +217,5 @@ def auto_upgrade(config):
         else:
             print("Checkpoint upgrade aborted.")
             exit(1)
+def make_list(obj):
+    return obj if isinstance(obj, list) else [obj]
